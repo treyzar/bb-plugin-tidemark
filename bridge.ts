@@ -5,10 +5,24 @@ export const targetSchema=z.object({threadId:z.string().min(1).max(200),interact
 const messageSchema=z.object({threadId:z.string().min(1).max(200),text:z.string().min(1).max(32000).refine(s=>s.trim().length>0)}).strict();
 export function validateMessage(input:unknown){return messageSchema.parse(input);}
 type Question={id:string;required:boolean;allowFreeText:boolean;multiSelect:boolean;options?:{value:string}[]};
-type Interaction={status:string;expiresAt?:number|null;payload:{kind:string;questions?:Question[];availableDecisions?:string[];subject?:{kind:string}}};
+type Interaction={status:string;expiresAt?:number|null;origin?:{kind:string;pluginId?:string;rendererId?:string};payload:{kind:string;questions?:Question[];availableDecisions?:string[];subject?:{kind:string};data?:unknown;title?:string}};
+const asyncQuestionsSchema=z.object({questions:z.array(z.object({title:z.string().trim().min(1),options:z.array(z.string().trim().min(1)).min(1).nullable().default(null)})).min(1)});
+export function isAsyncQuestion(interaction:Interaction){
+ return interaction.payload.kind==='plugin'&&interaction.origin?.kind==='plugin'&&interaction.origin.pluginId==='provider-codex'&&interaction.origin.rendererId==='async-question';
+}
+/** Match provider-codex's buildAsyncQuestionFormQuestions and renderer wire IDs. */
+export function normalizePayload(interaction:Interaction){
+ if(!isAsyncQuestion(interaction))return interaction.payload;
+ const parsed=asyncQuestionsSchema.safeParse(interaction.payload.data);
+ if(!parsed.success)return interaction.payload;
+ return {kind:'user_question',title:interaction.payload.title,questions:parsed.data.questions.map((q,i)=>({
+  id:`question-${i+1}`,prompt:q.title,shortLabel:`Question ${i+1}`,required:true,allowFreeText:true,multiSelect:false,
+  options:(q.options??[]).map((label,j)=>({value:`option-${j+1}`,label})),
+ }))};
+}
 export function validateAnswer(interaction:Interaction,input:unknown){
  if(interaction.status!=='pending'||(interaction.expiresAt!=null&&interaction.expiresAt<=Date.now()))throw new Error('Interaction is no longer pending');
- const body=requestSchema.parse(input),p=interaction.payload;
+ const body=requestSchema.parse(input),p=normalizePayload(interaction);
  if(p.kind==='approval'){
   if(p.subject?.kind==='permission_grant')throw new Error('Open permission grants in bb');
   if(!body.decision||!p.availableDecisions?.includes(body.decision)||body.answers)throw new Error('Invalid approval decision');

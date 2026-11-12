@@ -1,5 +1,5 @@
 import type { BbPluginApi } from '@get-bb/plugin-sdk';
-import { targetSchema, validateAnswer, validateMessage } from './bridge.ts';
+import { isAsyncQuestion, normalizePayload, targetSchema, validateAnswer, validateMessage } from './bridge.ts';
 
 /** External client API. All routes use bb's independent per-plugin token. */
 export default function plugin(bb: BbPluginApi) {
@@ -10,6 +10,7 @@ export default function plugin(bb: BbPluginApi) {
   type Pending = { id: string; threadId: string; threadTitle: string; payload: unknown };
   const cache = new Map<string, { at: number; items: Pending[] }>();
   const versions = new Map<string, number>();
+  const answering = new Set<string>();
   const invalidate = (id: string) => {
     cache.delete(id);
     versions.set(id, (versions.get(id) ?? 0) + 1);
@@ -55,7 +56,7 @@ export default function plugin(bb: BbPluginApi) {
           const version = versions.get(t.id) ?? 0;
           const items = (await bb.sdk.threads.interactions.list({ threadId: t.id }))
             .filter(x => x.status === 'pending')
-            .map(x => ({ id: x.id, threadId: t.id, threadTitle: t.title ?? t.id, payload: x.payload }));
+            .map(x => ({ id: x.id, threadId: t.id, threadTitle: t.title ?? t.id, payload: normalizePayload(x) }));
           if ((versions.get(t.id) ?? 0) === version) cache.set(t.id, { at: Date.now(), items });
           return items;
         } catch { incomplete = true; return []; }
@@ -76,19 +77,33 @@ export default function plugin(bb: BbPluginApi) {
   }, { auth: 'token' });
 
   bb.http.route('POST', '/answer', async c => {
+    let answeringKey: string | undefined;
     try {
       const raw = await c.req.text();
       if (raw.length > 128000) return c.json({ error: 'Request too large' }, 413);
       const body = JSON.parse(raw);
       const target = targetSchema.parse(body);
+      const key = JSON.stringify([target.threadId, target.interactionId]);
+      if (answering.has(key)) throw new Error('Interaction answer already in progress');
+      answering.add(key);
+      answeringKey = key;
       await permitted(target.threadId);
       const interaction = await bb.sdk.threads.interactions.get(target);
       const resolution = validateAnswer(interaction, body.response);
-      await bb.sdk.threads.interactions.resolve({ ...target, resolution });
+      if (isAsyncQuestion(interaction) && 'kind' in resolution && resolution.kind === 'user_answer') {
+        // Plugin input requests use respond(value), not provider resolve(user_answer).
+        const answers = Object.fromEntries(Object.entries(resolution.answers).map(([id, a]) => [id,
+          a.freeText?.trim() ? a : { selected: a.selected }]));
+        await bb.sdk.threads.interactions.respond({ ...target, value: { answers } });
+      } else {
+        await bb.sdk.threads.interactions.resolve({ ...target, resolution });
+      }
       invalidate(target.threadId);
       return c.json({ ok: true });
     } catch (error) {
       return c.json({ error: error instanceof Error ? error.message.slice(0, 500) : 'Answer rejected' }, 400);
+    } finally {
+      if (answeringKey) answering.delete(answeringKey);
     }
   }, { auth: 'token' });
 
